@@ -118,7 +118,7 @@ fe = pd.concat({d: days[d].set_index("NSE Symbol")["Future Equivalent OI"] for d
 def pct_change(prev, cur):
     return ((oi[cur] / oi[prev] - 1) * 100).replace([np.inf, -np.inf], np.nan)
 
-t1, t2, t3 = st.tabs(["OI change (date-wise)", "Decision hints (latest day)", "Latest MWPL & limit"])
+t1, tD, t2, t3 = st.tabs(["OI change (date-wise)", "Decision (date-wise)", "Decision hints (latest day)", "Latest MWPL & limit"])
 
 # ---------------------------------------------------------------- tab 1
 def limit_pct(d):
@@ -237,6 +237,82 @@ with t2:
         cc["MWPL % (limit÷MWPL)"] = st.column_config.NumberColumn(format="%.1f%%")
         cc["OI"] = st.column_config.NumberColumn(format="%d")
         st.dataframe(V, width="stretch", height=650, column_config=cc)
+
+# ---------------------------------------------------------------- decision window (date-wise)
+def decision_matrix():
+    mw = pd.concat({d: days[d].set_index("NSE Symbol")["MWPL"] for d in dates}, axis=1)
+    used = fe / mw * 100
+    lim = pd.concat({d: days[d].set_index("NSE Symbol")["Limit for Next Day"] for d in dates}, axis=1)
+    ban = lim.apply(lambda c: c.astype(str).str.lower().str.contains("no fresh"))
+    cells, code = pd.DataFrame(index=oi.index), pd.DataFrame(index=oi.index)
+    for i, d in enumerate(dates):
+        p = pct_change(dates[i - 1], d) if i else pd.Series(np.nan, index=oi.index)
+        def cell(sym):
+            pc, u, b = p[sym], used.at[sym, d], ban.at[sym, d]
+            if b: return "🔴 BAN"
+            if pd.isna(pc): base = ""
+            elif pc >= t_big: base = f"🟢🟢 {pc:+.1f}%"
+            elif pc >= t_buy: base = f"🟢 {pc:+.1f}%"
+            elif pc <= -t_big: base = f"🔵🔵 {pc:+.1f}%"
+            elif pc <= -t_buy: base = f"🔵 {pc:+.1f}%"
+            else: base = f"⚪ {pc:+.1f}%"
+            risk = " 🔴" if u >= t_ban else " 🟠" if u >= t_near else " 🟡" if u >= t_warn else ""
+            return (base + risk).strip()
+        cells[d] = [cell(x) for x in oi.index]
+        code[d] = np.where(p >= t_buy, 1, np.where(p <= -t_buy, -1, 0))
+    streak = []
+    for sym in oi.index:
+        row, n = code.loc[sym].tolist()[::-1], 0
+        if row and row[0] != 0:
+            while n < len(row) and row[n] == row[0]: n += 1
+            streak.append(f"{'🟢' if row[0] > 0 else '🔵'} {n}d {'build-up' if row[0] > 0 else 'unwinding'}")
+        else: streak.append("")
+    return cells, pd.Series(streak, index=oi.index, name="Streak")
+
+def cell_color(v):
+    v = str(v)
+    if "BAN" in v or v.endswith("🔴"): return "background-color:#f8c9c4"
+    if v.startswith("🟢🟢"): return "background-color:#7fd38a"
+    if v.startswith("🟢"): return "background-color:#c9efce"
+    if v.startswith("🔵🔵"): return "background-color:#8ab8ee"
+    if v.startswith("🔵"): return "background-color:#d3e4fa"
+    return ""
+
+with tD:
+    if len(dates) < 2:
+        st.info("Need at least 2 days of data.")
+    else:
+        H, last, prev = build_hints()
+        cells, streak = decision_matrix()
+        st.caption("Each cell = OI % change vs previous day. 🟢 build-up (🟢🟢 strong) · 🔵 unwinding (🔵🔵 heavy) · ⚪ neutral · "
+                   "🔴 BAN (no fresh positions) · risk dot after the % = MWPL used 🟡 watch / 🟠 near ban / 🔴 ban level. "
+                   "Confirm direction with price before trading. Not investment advice.")
+        g1, g2, g3, g4 = st.columns([2, 2, 2, 1])
+        show_only = g1.selectbox("Latest day filter", ["All", "Risk (ban / near ban)", "Build-up", "Strong build-up", "Unwinding"])
+        sortby = g2.selectbox("Sort by", ["Latest OI % (biggest rise)", "Latest OI % (biggest fall)", "MWPL used % (highest)", "Symbol"], key="ds")
+        mset = sorted({(d.year, d.month) for d in dates}, reverse=True)
+        msel = g3.selectbox("Month", mset, key="dm", format_func=lambda x: date(x[0], x[1], 1).strftime("%B %Y"))
+        newest = g4.checkbox("Newest first", True, key="dn")
+        q = st.text_input("Symbol filter", "", key="dq").strip().upper()
+        dcols = sorted([d for d in dates if (d.year, d.month) == msel], reverse=newest)
+        T = pd.concat([H[["Signal", "OI chg %", "MWPL used %"]].rename(columns={"Signal": "Latest signal"}),
+                       streak, cells[dcols].rename(columns=lambda d: f"{d:%d-%m-%Y}")], axis=1)
+        sig = T["Latest signal"]
+        mask = {"All": sig.notna(), "Risk (ban / near ban)": sig.str.contains("BAN"), "Build-up": sig.str.contains("BUILD-UP"),
+                "Strong build-up": sig.str.contains("STRONG"), "Unwinding": sig.str.contains("UNWINDING")}[show_only]
+        T = T[mask]
+        if q: T = T[T.index.str.contains(q, regex=False)]
+        T = {"Latest OI % (biggest rise)": T.sort_values("OI chg %", ascending=False),
+             "Latest OI % (biggest fall)": T.sort_values("OI chg %"),
+             "MWPL used % (highest)": T.sort_values("MWPL used %", ascending=False),
+             "Symbol": T.sort_index()}[sortby]
+        T = T.rename(columns={"OI chg %": "OI % (latest)"}); T.index.name = "NSE Symbol"
+        dnames = [c for c in T.columns if re.fullmatch(r"\d\d-\d\d-\d{4}", c)]
+        mapper = T.style.map if hasattr(T.style, "map") else T.style.applymap
+        sty = mapper(cell_color, subset=dnames).format({"OI % (latest)": "{:+.1f}%", "MWPL used %": "{:.1f}%"}, na_rep="")
+        st.dataframe(sty, width="stretch", height=650)
+        buf = io.BytesIO(); T.to_excel(buf, sheet_name="Decision")
+        st.download_button("Download as Excel", buf.getvalue(), "decision_window.xlsx")
 
 # ---------------------------------------------------------------- tab 3
 with t3:
