@@ -121,40 +121,59 @@ def pct_change(prev, cur):
 t1, t2, t3 = st.tabs(["OI change (date-wise)", "Decision hints (latest day)", "Latest MWPL & limit"])
 
 # ---------------------------------------------------------------- tab 1
+def limit_pct(d):
+    x = days[d].set_index("NSE Symbol")
+    return pd.to_numeric(x["Limit for Next Day"], errors="coerce") / x["MWPL"] * 100   # "No Fresh Positions" -> blank
+
+mp = pd.concat({d: limit_pct(d) for d in dates}, axis=1)
+
 with t1:
-    if len(dates) < 2:
+    v1, v2, v3, v4 = st.columns([2, 2, 2, 1])
+    view = v1.radio("Show", ["% change vs previous day", "Absolute change (contracts)",
+                             "MWPL %  (Limit for next day ÷ MWPL × 100)",
+                             "MWPL % change vs previous day (points)"])
+    kind = ["pct", "abs", "mwpl", "mwpl_chg"][["%", "A", "M", "M"].index(view[0]) if view[0] != "M" else (2 if "÷" in view else 3)]
+    if kind in ("pct", "abs", "mwpl_chg") and len(dates) < 2:
         st.info("Need at least 2 days of data.")
     else:
-        v1, v2, v3, v4 = st.columns([2, 2, 2, 1])
-        view = v1.radio("Show", ["% change vs previous day", "Absolute change (contracts)"], horizontal=False)
-        pct_view = view.startswith("%")
-        if not pct_view:
+        if kind == "abs":
             sign = v2.radio("Sign", ["Previous − Today (negative = OI rose)", "Today − Previous (positive = OI rose)"])
         chg = pd.DataFrame(index=oi.index)
-        for prev, cur in zip(dates, dates[1:]):
-            if pct_view: chg[cur] = pct_change(prev, cur)
-            else: chg[cur] = (oi[prev] - oi[cur]) if sign.startswith("Previous") else (oi[cur] - oi[prev])
+        if kind == "mwpl":
+            for d in dates: chg[d] = mp[d]
+        else:
+            for prev, cur in zip(dates, dates[1:]):
+                if kind == "pct": chg[cur] = pct_change(prev, cur)
+                elif kind == "mwpl_chg": chg[cur] = mp[cur] - mp[prev]
+                else: chg[cur] = (oi[prev] - oi[cur]) if sign.startswith("Previous") else (oi[cur] - oi[prev])
         months = sorted({(d.year, d.month) for d in chg.columns}, reverse=True)
         msel = v3.selectbox("Month", months, format_func=lambda x: date(x[0], x[1], 1).strftime("%B %Y"))
         chg = chg[[c for c in chg.columns if (c.year, c.month) == msel]]
         q = v3.text_input("Symbol filter", "").strip().upper()
         if q: chg = chg[chg.index.str.contains(q, regex=False)]
-        newest = v4.checkbox("Newest first", False)
+        newest = v4.checkbox("Newest first", True)
         chg = chg[sorted(chg.columns, reverse=newest)]
         show = chg.copy(); show.columns = [f"{c:%d-%m-%Y}" for c in show.columns]; show.index.name = "NSE Symbol"
         if show.empty:
             st.info("No rows.")
         else:
-            if pct_view:
+            if kind == "pct":
                 st.caption("Green = OI rose, red = OI fell. Colour scale capped at ±20%.")
-                st.dataframe(show.style.format("{:+.1f}%", na_rep="").background_gradient(
-                    cmap="RdYlGn", axis=None, vmin=-20, vmax=20), width="stretch", height=650)
+                sty = show.style.format("{:+.1f}%", na_rep="").background_gradient(cmap="RdYlGn", axis=None, vmin=-20, vmax=20)
+            elif kind == "mwpl":
+                st.caption("Limit for next day ÷ MWPL × 100 = how much of MWPL is still open for new positions. "
+                           "Low (red) = crowded, near ban. Blank = 'No Fresh Positions' (in ban).")
+                sty = show.style.format("{:.1f}%", na_rep="").background_gradient(cmap="RdYlGn", axis=None, vmin=0, vmax=100)
+            elif kind == "mwpl_chg":
+                st.caption("Change in MWPL % vs previous day, in percentage points. "
+                           "Negative (red) = less room left = more OI built up. Positive (green) = room freed.")
+                sty = show.style.format("{:+.1f}", na_rep="").background_gradient(cmap="RdYlGn", axis=None, vmin=-10, vmax=10)
             else:
                 mx = float(show.abs().max().max()) or 1
-                cmap = "RdYlGn_r" if sign.startswith("Previous") else "RdYlGn"
                 st.caption("Green = OI rose, red = OI fell.")
-                st.dataframe(show.style.format("{:,.0f}", na_rep="").background_gradient(
-                    cmap=cmap, axis=None, vmin=-mx, vmax=mx), width="stretch", height=650)
+                sty = show.style.format("{:,.0f}", na_rep="").background_gradient(
+                    cmap="RdYlGn_r" if sign.startswith("Previous") else "RdYlGn", axis=None, vmin=-mx, vmax=mx)
+            st.dataframe(sty, width="stretch", height=650)
             buf = io.BytesIO(); show.to_excel(buf, sheet_name="OI change")
             st.download_button("Download as Excel", buf.getvalue(), "oi_change.xlsx")
 
@@ -166,6 +185,7 @@ def build_hints():
     first = dates[max(0, len(dates) - 6)]            # up to 5 sessions back
     df[f"OI chg % ({(last - first).days}d)"] = ((oi[last] / oi[first] - 1) * 100).replace([np.inf, -np.inf], np.nan) if first != last else np.nan
     df["MWPL used %"] = (L["Future Equivalent OI"] / L["MWPL"] * 100)
+    df["MWPL % (limit÷MWPL)"] = pd.to_numeric(L["Limit for Next Day"], errors="coerce") / L["MWPL"] * 100
     df["Next-day limit"] = L["Limit for Next Day"]
     def hint(r):
         s, h = [], []
@@ -214,6 +234,7 @@ with t2:
         m4.metric("OI ≤ −%g%%" % t_buy, int(H["Signal"].str.contains("UNWINDING").sum()))
         cc = {c: st.column_config.NumberColumn(format="%+.1f%%") for c in V.columns if c.startswith("OI chg")}
         cc["MWPL used %"] = st.column_config.NumberColumn(format="%.1f%%")
+        cc["MWPL % (limit÷MWPL)"] = st.column_config.NumberColumn(format="%.1f%%")
         cc["OI"] = st.column_config.NumberColumn(format="%d")
         st.dataframe(V, width="stretch", height=650, column_config=cc)
 
@@ -221,5 +242,6 @@ with t2:
 with t3:
     last = dates[-1]; L = days[last].copy()
     L["MWPL used %"] = (L["Future Equivalent OI"] / L["MWPL"] * 100).round(1)
+    L["MWPL % (limit÷MWPL)"] = (pd.to_numeric(L["Limit for Next Day"], errors="coerce") / L["MWPL"] * 100).round(1)
     st.caption(f"Data for {last:%d-%m-%Y}. MWPL used % = Future Equivalent OI / MWPL. Limit applies to next trading day.")
     st.dataframe(L.sort_values("MWPL used %", ascending=False), width="stretch", hide_index=True, height=650)
