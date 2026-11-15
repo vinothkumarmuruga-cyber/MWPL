@@ -25,7 +25,7 @@ def clean(df):
     return df[COLS].drop_duplicates("NSE Symbol")
 
 @st.cache_data(show_spinner=False)
-def load_repo_days(_sig):
+def load_repo_days(sig):
     out = {}
     for f in DATA_DIR.glob("combineoi_*.csv"):
         m = re.search(r"(\d{8})", f.name)
@@ -63,6 +63,7 @@ def has_secret(k):
 if "new" not in st.session_state: st.session_state.new = {}
 days = dict(load_repo_days(len(list(DATA_DIR.glob("*.csv")))))
 days.update(st.session_state.new)
+days = {d: clean(df) for d, df in days.items()}   # normalise old-format days kept in session
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
