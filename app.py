@@ -2,6 +2,7 @@ import base64, io, re, zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -9,28 +10,32 @@ import streamlit as st
 st.set_page_config(page_title="NSE OI / MWPL Tracker", layout="wide")
 DATA_DIR = Path(__file__).parent / "data"
 URL = "https://nsearchives.nseindia.com/archives/nsccl/mwpl/combineoi_{d}.zip"
-COLS = ["NSE Symbol", "MWPL", "Open Interest", "Limit for Next Day"]
+COLS = ["NSE Symbol", "MWPL", "Open Interest", "Future Equivalent OI", "Limit for Next Day"]
 HEAD = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Referer": "https://www.nseindia.com/"}
 
 # ---------------------------------------------------------------- data layer
+def clean(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Future Equivalent OI" not in df: df["Future Equivalent OI"] = np.nan
+    df["NSE Symbol"] = df["NSE Symbol"].astype(str).str.strip()
+    df["Limit for Next Day"] = df["Limit for Next Day"].astype(str).str.strip()
+    return df[COLS].drop_duplicates("NSE Symbol")
+
 @st.cache_data(show_spinner=False)
 def load_repo_days(_sig):
     out = {}
     for f in DATA_DIR.glob("combineoi_*.csv"):
         m = re.search(r"(\d{8})", f.name)
-        if m:
-            out[datetime.strptime(m.group(1), "%d%m%Y").date()] = pd.read_csv(f)
+        if m: out[datetime.strptime(m.group(1), "%d%m%Y").date()] = clean(pd.read_csv(f))
     return out
 
 def parse_zip(content: bytes) -> pd.DataFrame:
     with zipfile.ZipFile(io.BytesIO(content)) as z:
         name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
-        df = pd.read_csv(io.BytesIO(z.read(name)))
-    df.columns = [str(c).strip() for c in df.columns]
-    df["NSE Symbol"] = df["NSE Symbol"].astype(str).str.strip()
-    return df[COLS]
+        return clean(pd.read_csv(io.BytesIO(z.read(name))))
 
 def fetch_day(d: date):
     s = requests.Session(); s.headers.update(HEAD)
@@ -42,8 +47,7 @@ def fetch_day(d: date):
 def github_save(d: date, df: pd.DataFrame):
     tok, repo = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"]
     branch = st.secrets.get("GITHUB_BRANCH", "main")
-    path = f"data/combineoi_{d:%d%m%Y}.csv"
-    api = f"https://api.github.com/repos/{repo}/contents/{path}"
+    api = f"https://api.github.com/repos/{repo}/contents/data/combineoi_{d:%d%m%Y}.csv"
     h = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
     sha = requests.get(api, headers=h, params={"ref": branch}).json().get("sha")
     body = {"message": f"Add OI data {d:%d-%m-%Y}", "branch": branch,
@@ -51,22 +55,24 @@ def github_save(d: date, df: pd.DataFrame):
     if sha: body["sha"] = sha
     return requests.put(api, headers=h, json=body).status_code in (200, 201)
 
+def has_secret(k):
+    try: return k in st.secrets
+    except Exception: return False
+
 # ---------------------------------------------------------------- state
 if "new" not in st.session_state: st.session_state.new = {}
 days = dict(load_repo_days(len(list(DATA_DIR.glob("*.csv")))))
 days.update(st.session_state.new)
 
-# ---------------------------------------------------------------- sidebar: add data
+# ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("Add data")
     ups = st.file_uploader("Upload NSE combineoi zip(s)", type="zip", accept_multiple_files=True)
-    if ups:
-        for u in ups:
-            m = re.search(r"(\d{8})", u.name)
-            if m:
-                d = datetime.strptime(m.group(1), "%d%m%Y").date()
-                if d not in st.session_state.new:
-                    st.session_state.new[d] = parse_zip(u.getvalue())
+    for u in ups or []:
+        m = re.search(r"(\d{8})", u.name)
+        if m:
+            d = datetime.strptime(m.group(1), "%d%m%Y").date()
+            if d not in st.session_state.new: st.session_state.new[d] = parse_zip(u.getvalue())
     st.divider()
     c1, c2 = st.columns(2)
     d_from = c1.date_input("From", date.today() - timedelta(days=1), format="DD/MM/YYYY")
@@ -86,51 +92,133 @@ with st.sidebar:
     if st.session_state.new:
         st.divider()
         st.caption(f"{len(st.session_state.new)} unsaved day(s) (lost on restart)")
-        if "GITHUB_TOKEN" in st.secrets and st.button("Save new days to GitHub", width="stretch"):
-            ok = sum(github_save(d, df) for d, df in st.session_state.new.items())
-            st.success(f"Committed {ok}/{len(st.session_state.new)} file(s). App redeploys shortly.")
-        elif "GITHUB_TOKEN" not in st.secrets:
+        if has_secret("GITHUB_TOKEN"):
+            if st.button("Save new days to GitHub", width="stretch"):
+                ok = sum(github_save(d, df) for d, df in st.session_state.new.items())
+                st.success(f"Committed {ok}/{len(st.session_state.new)} file(s). App redeploys shortly.")
+        else:
             st.caption("Add GITHUB_TOKEN / GITHUB_REPO in app Secrets to save permanently.")
+    st.divider()
+    st.header("Signal thresholds")
+    t_buy = st.number_input("OI change % = notable", 1.0, 50.0, 5.0, 0.5)
+    t_big = st.number_input("OI change % = strong", 1.0, 100.0, 10.0, 0.5)
+    t_warn = st.number_input("MWPL used % = watch", 50.0, 100.0, 80.0, 1.0)
+    t_near = st.number_input("MWPL used % = near ban", 50.0, 100.0, 90.0, 1.0)
+    t_ban = st.number_input("MWPL used % = ban level", 50.0, 100.0, 95.0, 1.0)
 
 st.title("NSE OI / MWPL Tracker")
-if len(days) < 1:
+if not days:
     st.info("No data yet. Upload zips or fetch from NSE in the sidebar."); st.stop()
 
-# ---------------------------------------------------------------- OI change table
 dates = sorted(days)
-oi = pd.concat({d: days[d].drop_duplicates("NSE Symbol").set_index("NSE Symbol")["Open Interest"]
-                for d in dates}, axis=1)
-sign = st.radio("OI change", ["Previous day − Today  (your sheet; negative = OI rose)",
-                              "Today − Previous day  (positive = OI rose)"], horizontal=True)
-chg = pd.DataFrame(index=oi.index)
-for prev, cur in zip(dates, dates[1:]):
-    chg[cur] = (oi[prev] - oi[cur]) if sign.startswith("Previous") else (oi[cur] - oi[prev])
-f1, f2, f3 = st.columns([2, 2, 1])
-months = sorted({(d.year, d.month) for d in chg.columns}, reverse=True)
-if months:
-    msel = f1.selectbox("Month", months, format_func=lambda x: date(x[0], x[1], 1).strftime("%B %Y"))
-    chg = chg[[c for c in chg.columns if (c.year, c.month) == msel]]
-q = f2.text_input("Symbol filter", "").strip().upper()
-if q: chg = chg[chg.index.str.contains(q, regex=False)]
-newest_first = f3.checkbox("Newest date first", False)
-chg = chg[sorted(chg.columns, reverse=newest_first)]
-show = chg.copy(); show.columns = [f"{c:%d-%m-%Y}" for c in show.columns]
-show.index.name = "NSE Symbol"
+oi = pd.concat({d: days[d].set_index("NSE Symbol")["Open Interest"] for d in dates}, axis=1)
+fe = pd.concat({d: days[d].set_index("NSE Symbol")["Future Equivalent OI"] for d in dates}, axis=1)
 
-t1, t2 = st.tabs(["OI change (date-wise)", "Latest MWPL & limit"])
+def pct_change(prev, cur):
+    return ((oi[cur] / oi[prev] - 1) * 100).replace([np.inf, -np.inf], np.nan)
+
+t1, t2, t3 = st.tabs(["OI change (date-wise)", "Decision hints (latest day)", "Latest MWPL & limit"])
+
+# ---------------------------------------------------------------- tab 1
 with t1:
-    mx = float(show.abs().max().max()) if not show.empty else 0
-    cmap = "RdYlGn_r" if sign.startswith("Previous") else "RdYlGn"   # green = OI rose
-    st.caption("Green = OI increased, red = OI decreased")
-    st.dataframe(show.style.format("{:,.0f}", na_rep="").background_gradient(
-        cmap=cmap, axis=None, vmin=-mx, vmax=mx) if mx else show,
-        width="stretch", height=650)
-    buf = io.BytesIO(); show.to_excel(buf, sheet_name="OI change")
-    st.download_button("Download as Excel", buf.getvalue(), "oi_change.xlsx")
+    if len(dates) < 2:
+        st.info("Need at least 2 days of data.")
+    else:
+        v1, v2, v3, v4 = st.columns([2, 2, 2, 1])
+        view = v1.radio("Show", ["% change vs previous day", "Absolute change (contracts)"], horizontal=False)
+        pct_view = view.startswith("%")
+        if not pct_view:
+            sign = v2.radio("Sign", ["Previous − Today (negative = OI rose)", "Today − Previous (positive = OI rose)"])
+        chg = pd.DataFrame(index=oi.index)
+        for prev, cur in zip(dates, dates[1:]):
+            if pct_view: chg[cur] = pct_change(prev, cur)
+            else: chg[cur] = (oi[prev] - oi[cur]) if sign.startswith("Previous") else (oi[cur] - oi[prev])
+        months = sorted({(d.year, d.month) for d in chg.columns}, reverse=True)
+        msel = v3.selectbox("Month", months, format_func=lambda x: date(x[0], x[1], 1).strftime("%B %Y"))
+        chg = chg[[c for c in chg.columns if (c.year, c.month) == msel]]
+        q = v3.text_input("Symbol filter", "").strip().upper()
+        if q: chg = chg[chg.index.str.contains(q, regex=False)]
+        newest = v4.checkbox("Newest first", False)
+        chg = chg[sorted(chg.columns, reverse=newest)]
+        show = chg.copy(); show.columns = [f"{c:%d-%m-%Y}" for c in show.columns]; show.index.name = "NSE Symbol"
+        if show.empty:
+            st.info("No rows.")
+        else:
+            if pct_view:
+                st.caption("Green = OI rose, red = OI fell. Colour scale capped at ±20%.")
+                st.dataframe(show.style.format("{:+.1f}%", na_rep="").background_gradient(
+                    cmap="RdYlGn", axis=None, vmin=-20, vmax=20), width="stretch", height=650)
+            else:
+                mx = float(show.abs().max().max()) or 1
+                cmap = "RdYlGn_r" if sign.startswith("Previous") else "RdYlGn"
+                st.caption("Green = OI rose, red = OI fell.")
+                st.dataframe(show.style.format("{:,.0f}", na_rep="").background_gradient(
+                    cmap=cmap, axis=None, vmin=-mx, vmax=mx), width="stretch", height=650)
+            buf = io.BytesIO(); show.to_excel(buf, sheet_name="OI change")
+            st.download_button("Download as Excel", buf.getvalue(), "oi_change.xlsx")
+
+# ---------------------------------------------------------------- tab 2
+def build_hints():
+    last, prev = dates[-1], dates[-2]
+    L = days[last].set_index("NSE Symbol")
+    df = pd.DataFrame({"OI": L["Open Interest"], "OI chg %": pct_change(prev, last)})
+    first = dates[max(0, len(dates) - 6)]            # up to 5 sessions back
+    df[f"OI chg % ({(last - first).days}d)"] = ((oi[last] / oi[first] - 1) * 100).replace([np.inf, -np.inf], np.nan) if first != last else np.nan
+    df["MWPL used %"] = (L["Future Equivalent OI"] / L["MWPL"] * 100)
+    df["Next-day limit"] = L["Limit for Next Day"]
+    def hint(r):
+        s, h = [], []
+        lim = str(r["Next-day limit"]).lower()
+        u, c = r["MWPL used %"], r["OI chg %"]
+        if "no fresh" in lim:
+            s.append("🔴 BAN"); h.append("In F&O ban: only square-off allowed, no fresh positions. Expect unwinding; avoid new entries until it exits the ban list")
+        elif pd.notna(u) and u >= t_ban:
+            s.append("🔴 BAN LEVEL"); h.append("At ban threshold: ban likely next session - avoid fresh positions")
+        elif pd.notna(u) and u >= t_near:
+            s.append("🟠 NEAR BAN"); h.append("Close to ban: fresh positions risky, expect squaring-off")
+        elif pd.notna(u) and u >= t_warn:
+            s.append("🟡 WATCH MWPL"); h.append("Crowded F&O stock: monitor daily")
+        if pd.notna(c):
+            if c >= t_big: s.append("🟢 STRONG BUILD-UP"); h.append("Big fresh positions added - check price direction: price up = long build-up, price down = short build-up")
+            elif c >= t_buy: s.append("🟢 BUILD-UP"); h.append("OI rising - confirm with price")
+            elif c <= -t_big: s.append("🔵 HEAVY UNWINDING"); h.append("Many positions closed - trend may be exhausting: price up = short covering, price down = long unwinding")
+            elif c <= -t_buy: s.append("🔵 UNWINDING"); h.append("OI falling - move losing support")
+        return pd.Series({"Signal": " + ".join(s) or "⚪ Neutral", "Hint": ". ".join(h) or "No notable OI move"})
+    return pd.concat([df, df.apply(hint, axis=1)], axis=1), last, prev
+
 with t2:
-    last = dates[-1]
-    L = days[last].copy()
-    L["OI % of MWPL"] = (L["Open Interest"] / L["MWPL"] * 100).round(1)
-    st.caption(f"Data for {last:%d-%m-%Y}  (limit shown applies to next trading day)")
-    st.dataframe(L.sort_values("OI % of MWPL", ascending=False), width="stretch",
-                 hide_index=True, height=650)
+    if len(dates) < 2:
+        st.info("Need at least 2 days of data.")
+    else:
+        H, last, prev = build_hints()
+        st.caption(f"Latest {last:%d-%m-%Y} vs previous {prev:%d-%m-%Y}. OI alone shows participation, not direction - "
+                   "always confirm with price: price↑+OI↑ long build-up · price↓+OI↑ short build-up · "
+                   "price↑+OI↓ short covering · price↓+OI↓ long unwinding. Not investment advice.")
+        f1, f2, f3 = st.columns([3, 2, 2])
+        opts = ["🔴 BAN", "🔴 BAN LEVEL", "🟠 NEAR BAN", "🟡 WATCH MWPL", "🟢 STRONG BUILD-UP",
+                "🟢 BUILD-UP", "🔵 HEAVY UNWINDING", "🔵 UNWINDING", "⚪ Neutral"]
+        pick = f1.multiselect("Show signals", opts, default=[o for o in opts if o != "⚪ Neutral"])
+        sortby = f2.selectbox("Sort by", ["OI chg % (biggest rise)", "OI chg % (biggest fall)", "MWPL used % (highest)", "Symbol"])
+        q = f3.text_input("Symbol", "", key="hq").strip().upper()
+        V = H[H["Signal"].apply(lambda s: any(p in s for p in pick))]
+        if q: V = V[V.index.str.contains(q, regex=False)]
+        V = {"OI chg % (biggest rise)": V.sort_values("OI chg %", ascending=False),
+             "OI chg % (biggest fall)": V.sort_values("OI chg %"),
+             "MWPL used % (highest)": V.sort_values("MWPL used %", ascending=False),
+             "Symbol": V.sort_index()}[sortby]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("In ban / ban level", int(H["Signal"].str.contains("BAN").sum() - H["Signal"].str.contains("NEAR BAN").sum()))
+        m2.metric("Near ban (≥%d%%)" % t_near, int(H["Signal"].str.contains("NEAR BAN").sum()))
+        m3.metric("OI ≥ +%g%%" % t_buy, int(H["Signal"].str.contains("BUILD-UP").sum()))
+        m4.metric("OI ≤ −%g%%" % t_buy, int(H["Signal"].str.contains("UNWINDING").sum()))
+        cc = {c: st.column_config.NumberColumn(format="%+.1f%%") for c in V.columns if c.startswith("OI chg")}
+        cc["MWPL used %"] = st.column_config.NumberColumn(format="%.1f%%")
+        cc["OI"] = st.column_config.NumberColumn(format="%d")
+        st.dataframe(V, width="stretch", height=650, column_config=cc)
+
+# ---------------------------------------------------------------- tab 3
+with t3:
+    last = dates[-1]; L = days[last].copy()
+    L["MWPL used %"] = (L["Future Equivalent OI"] / L["MWPL"] * 100).round(1)
+    st.caption(f"Data for {last:%d-%m-%Y}. MWPL used % = Future Equivalent OI / MWPL. Limit applies to next trading day.")
+    st.dataframe(L.sort_values("MWPL used %", ascending=False), width="stretch", hide_index=True, height=650)
